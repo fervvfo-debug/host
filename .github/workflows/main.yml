@@ -5,7 +5,7 @@ on:
 
 jobs:
   win-rdp:
-    runs-on: demo
+    runs-on: self-hosted
 
     env:
       NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
