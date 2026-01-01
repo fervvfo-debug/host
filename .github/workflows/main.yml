@@ -1,0 +1,172 @@
+name: Win-11-128Cores-32GB-512SSD-RDP-Ngrok
+
+on:
+  workflow_dispatch:
+
+jobs:
+  win-rdp:
+    runs-on: self-hosted && windows
+    env:
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+    steps:
+    - name: Print system info
+      shell: powershell
+      run: |
+        Write-Host "=== SYSTEM INFO ==="
+        $info = Get-CimInstance Win32_ComputerSystem
+        $ram = [math]::Round($info.TotalPhysicalMemory/1GB,2)
+        Write-Host "RAM: $ram GB"
+
+        $cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+        Write-Host "Cores: $cpu"
+
+        $disk = Get-PSDrive C
+        $diskGB = [math]::Round(($disk.Used + $disk.Free)/1GB,2)
+        Write-Host "Disk: $diskGB GB"
+
+    - name: Install ngrok
+      shell: powershell
+      run: |
+        $path = "$env:USERPROFILE\ngrok"
+        if (!(Test-Path $path)) { New-Item -ItemType Directory -Path $path | Out-Null }
+        $zip = "$path\ngrok.zip"
+
+        Write-Host "Downloading ngrok..."
+        iwr "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" -OutFile $zip -UseBasicParsing
+
+        Expand-Archive $zip -DestinationPath $path -Force
+        Remove-Item $zip -Force
+
+        Write-Host "ngrok installed."
+
+    - name: Configure ngrok
+      shell: powershell
+      run: |
+        $ngrok = "$env:USERPROFILE\ngrok\ngrok.exe"
+
+        if (!(Test-Path $ngrok)) {
+          throw "Ngrok missing!"
+        }
+
+        if ($env:NGROK_AUTHTOKEN) {
+          & $ngrok authtoken $env:NGROK_AUTHTOKEN
+        } else {
+          Write-Warning "NGROK_AUTHTOKEN missing!"
+        }
+
+    - name: Enable RDP anti offline
+      shell: powershell
+      run: |
+        Write-Host "Applying RDP settings and anti-offline protections..."
+
+        # Allow remote desktop connections
+        Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+
+        # Ensure firewall rules allow Remote Desktop
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+        # Ensure the TermService runs automatically and is started
+        sc.exe config TermService start= auto
+        Set-Service -Name TermService -StartupType Automatic
+        Start-Service TermService -ErrorAction SilentlyContinue
+
+        # Configure service recovery: restart on failure (first, second, subsequent)
+        # reset= 0 => no reset of failure count
+        # actions= restart/60000/restart/60000/restart/60000 => restart after 60s on failures
+        sc.exe failure TermService reset= 0 actions= restart/60000/restart/60000/restart/60000
+
+        Write-Host "Configured service recovery for TermService."
+
+        # Create a small monitor script that will start TermService if it's not running
+        $monitorPath = Join-Path $env:ProgramData "Keep-TermService-Alive.ps1"
+        $monitorScript = @'
+# Use Select-Object -First 1 to avoid array results and then do an explicit null check.
+$svc = Get-Service -Name TermService -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $svc) {
+  Write-Output "TermService not found."
+  return
+}
+
+if ($svc.Status -ne "Running") {
+  Write-Output "TermService not running. Attempting Start-Service..."
+  try {
+    Start-Service -Name TermService -ErrorAction Stop
+    Start-Sleep -Seconds 5
+    Write-Output "Status after attempt: $((Get-Service -Name TermService -ErrorAction SilentlyContinue).Status)"
+  } catch {
+    Write-Warning "Failed to start TermService: $_"
+  }
+} else {
+  # Optional: re-enable firewall rules if somehow disabled
+  try { Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue } catch {}
+}
+'@
+
+        Set-Content -Path $monitorPath -Value $monitorScript -Force -Encoding UTF8
+
+        Write-Host "Monitor script written to $monitorPath"
+
+        # Register a scheduled task that runs every 5 minutes as SYSTEM to keep TermService alive.
+        # Using schtasks so the task can be created as SYSTEM without requiring a password.
+        $taskName = "Keep-TermService-Alive"
+        $taskAction = "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$monitorPath`""
+        schtasks /Create /SC MINUTE /MO 5 /TN "$taskName" /TR "$taskAction" /RU "SYSTEM" /F | Out-Null
+
+        Write-Host "Scheduled task '$taskName' created to run every 5 minutes."
+
+        Write-Host "RDP anti-offline configuration completed."
+
+    - name: Create RDP user
+      shell: powershell
+      run: |
+        $user = "rdpuser"
+
+        if (!$env:RDP_PASSWORD) {
+          $pw = "Rdp12345!"
+          Write-Warning "RDP_PASSWORD not set. Using fallback!"
+        } else {
+          $pw = $env:RDP_PASSWORD
+        }
+
+        $secPw = ConvertTo-SecureString $pw -AsPlainText -Force
+
+        if (!(Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+          New-LocalUser -Name $user -Password $secPw
+        } else {
+          Set-LocalUser -Name $user -Password $secPw
+        }
+
+        Add-LocalGroupMember -Group administrators -Member $user -ErrorAction SilentlyContinue
+        Write-Host "RDP user ready."
+
+    - name: Start ngrok tunnel
+      shell: powershell
+      run: |
+        $ngrok = "$env:USERPROFILE\ngrok\ngrok.exe"
+        Start-Process $ngrok -ArgumentList "tcp 3389" -WindowStyle Hidden
+
+        Write-Host "Waiting for ngrok (15s)..."
+        Start-Sleep 15
+
+        try {
+          $api = Invoke-RestMethod "http://127.0.0.1:4040/api/tunnels"
+          $url = $api.tunnels.public_url
+          Write-Host "===================================="
+          Write-Host "   RDP ADDRESS: $url"
+          Write-Host "   USER: rdpuser"
+          Write-Host "   PASS: (your secret)"
+          Write-Host "===================================="
+        } catch {
+          Write-Warning "Ngrok API not ready yet."
+        }
+
+    - name: Keep alive
+      shell: powershell
+      run: |
+        Write-Host "Session alive. Will emit a heartbeat every 5 minutes. Press CTRL+C to stop."
+        while ($true) {
+          Write-Host "HEARTBEAT: $(Get-Date -Format o)"
+          Start-Sleep -Seconds 300
+        }
