@@ -1,10 +1,10 @@
-name: Win-11-128Cores-32GB-512SSD-RDP-Ngrok
+name: Win11-RDP-Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  win-rdp:
+  build:
     runs-on: self-hosted
 
     env:
@@ -12,140 +12,102 @@ jobs:
       RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
     steps:
-    - name: Print system info
-      shell: pwsh
-      run: |
-        Write-Host "=== SYSTEM INFO ==="
-        $cs = Get-CimInstance Win32_ComputerSystem
-        $ram = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
-        Write-Host "RAM: $ram GB"
+      - name: System info
+        shell: powershell
+        run: |
+          Write-Host "Runner OK"
+          hostname
+          whoami
+          $PSVersionTable
 
-        $cores = (Get-CimInstance Win32_Processor |
-          Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
-        Write-Host "Cores: $cores"
+      - name: Install ngrok
+        shell: powershell
+        run: |
+          $dir = "$env:USERPROFILE\ngrok"
+          $exe = "$dir\ngrok.exe"
 
-        $disk = Get-PSDrive C:
-        $diskGB = [math]::Round(($disk.Used + $disk.Free) / 1GB, 2)
-        Write-Host "Disk: $diskGB GB"
+          if (!(Test-Path $exe)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            $zip = "$dir\ngrok.zip"
 
-    - name: Install ngrok
-      shell: pwsh
-      run: |
-        $dir = "$env:USERPROFILE\ngrok"
-        $exe = "$dir\ngrok.exe"
+            Invoke-WebRequest `
+              "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" `
+              -OutFile $zip
 
-        if (!(Test-Path $exe)) {
-          New-Item -ItemType Directory -Path $dir -Force | Out-Null
-          $zip = "$dir\ngrok.zip"
+            Expand-Archive $zip -DestinationPath $dir -Force
+            Remove-Item $zip -Force
+          }
 
-          Invoke-WebRequest `
-            "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" `
-            -OutFile $zip
+          & $exe version
 
-          Expand-Archive $zip -DestinationPath $dir -Force
-          Remove-Item $zip -Force
-        }
+      - name: Configure ngrok
+        shell: powershell
+        run: |
+          if (!$env:NGROK_AUTHTOKEN) {
+            throw "NGROK_AUTHTOKEN missing"
+          }
+          & "$env:USERPROFILE\ngrok\ngrok.exe" authtoken $env:NGROK_AUTHTOKEN
 
-        Write-Host "ngrok ready."
+      - name: Enable RDP + anti-offline
+        shell: powershell
+        run: |
+          Set-ItemProperty `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
 
-    - name: Configure ngrok
-      shell: pwsh
-      run: |
-        $ngrok = "$env:USERPROFILE\ngrok\ngrok.exe"
-        if (!$env:NGROK_AUTHTOKEN) {
-          throw "NGROK_AUTHTOKEN missing"
-        }
-        & $ngrok authtoken $env:NGROK_AUTHTOKEN
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
 
-    - name: Enable RDP + anti-offline
-      shell: pwsh
-      run: |
-        Write-Host "Configuring RDP..."
+          sc.exe config TermService start= auto | Out-Null
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService -ErrorAction SilentlyContinue
 
-        Set-ItemProperty `
-          "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-          fDenyTSConnections 0
+          sc.exe failure TermService `
+            reset= 0 `
+            actions= restart/60000/restart/60000/restart/60000 | Out-Null
 
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
-          -ErrorAction SilentlyContinue
+      - name: Create RDP user
+        shell: powershell
+        run: |
+          $user = "rdpuser"
+          $pw = $env:RDP_PASSWORD
+          if (!$pw) { $pw = "Rdp12345!" }
 
-        sc.exe config TermService start= auto | Out-Null
-        Set-Service TermService -StartupType Automatic
-        Start-Service TermService -ErrorAction SilentlyContinue
+          $sec = ConvertTo-SecureString $pw -AsPlainText -Force
 
-        sc.exe failure TermService `
-          reset= 0 `
-          actions= restart/60000/restart/60000/restart/60000 | Out-Null
+          if (!(Get-LocalUser $user -ErrorAction SilentlyContinue)) {
+            New-LocalUser $user -Password $sec
+          } else {
+            Set-LocalUser $user -Password $sec
+          }
 
-        $monitor = Join-Path $env:ProgramData "Keep-TermService-Alive.ps1"
+          Add-LocalGroupMember administrators $user -ErrorAction SilentlyContinue
 
-        @'
-$svc = Get-Service TermService -ErrorAction SilentlyContinue | Select-Object -First 1
+      - name: Start ngrok tunnel
+        shell: powershell
+        run: |
+          $ngrok = "$env:USERPROFILE\ngrok\ngrok.exe"
+          Start-Process $ngrok -ArgumentList "tcp 3389" -WindowStyle Hidden
 
-if ($null -eq $svc) {
-    Write-Host "TermService not found"
-    exit 0
-}
+          Start-Sleep 15
 
-if ($svc.Status -ne "Running") {
-    Start-Service TermService -ErrorAction SilentlyContinue
-}
-Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-'@ | Set-Content $monitor -Encoding UTF8 -Force
+          $api = Invoke-RestMethod http://127.0.0.1:4040/api/tunnels
+          $tcp = $api.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
 
-        schtasks /Delete /TN "Keep-TermService-Alive" /F 2>$null
-        schtasks /Create `
-          /SC MINUTE /MO 5 `
-          /TN "Keep-TermService-Alive" `
-          /RU SYSTEM `
-          /TR "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$monitor`"" `
-          /F | Out-Null
+          if ($tcp) {
+            Write-Host "==============================="
+            Write-Host "RDP ADDRESS: $($tcp.public_url)"
+            Write-Host "USER: rdpuser"
+            Write-Host "PASS: (secret)"
+            Write-Host "==============================="
+          } else {
+            Write-Warning "No TCP tunnel yet"
+          }
 
-        Write-Host "RDP protection active."
-
-    - name: Create RDP user
-      shell: pwsh
-      run: |
-        $user = "rdpuser"
-        $pw = $env:RDP_PASSWORD
-        if (!$pw) { $pw = "Rdp12345!" }
-
-        $sec = ConvertTo-SecureString $pw -AsPlainText -Force
-
-        if (!(Get-LocalUser $user -ErrorAction SilentlyContinue)) {
-          New-LocalUser $user -Password $sec
-        } else {
-          Set-LocalUser $user -Password $sec
-        }
-
-        Add-LocalGroupMember administrators $user -ErrorAction SilentlyContinue
-        Write-Host "RDP user ready."
-
-    - name: Start ngrok tunnel
-      shell: pwsh
-      run: |
-        $ngrok = "$env:USERPROFILE\ngrok\ngrok.exe"
-        Start-Process $ngrok -ArgumentList "tcp 3389" -WindowStyle Hidden
-
-        Start-Sleep 15
-
-        $tunnels = Invoke-RestMethod http://127.0.0.1:4040/api/tunnels
-        $tcp = $tunnels.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
-
-        if ($tcp) {
-          Write-Host "==============================="
-          Write-Host "RDP ADDRESS: $($tcp.public_url)"
-          Write-Host "USER: rdpuser"
-          Write-Host "PASS: (secret)"
-          Write-Host "==============================="
-        } else {
-          Write-Warning "No TCP tunnel yet"
-        }
-
-    - name: Keep alive
-      shell: pwsh
-      run: |
-        while ($true) {
-          Write-Host "HEARTBEAT $(Get-Date -Format o)"
-          Start-Sleep 300
-        }
+      - name: Keep alive
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "HEARTBEAT $(Get-Date -Format o)"
+            Start-Sleep 300
+          }
